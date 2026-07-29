@@ -11,24 +11,49 @@ import (
 	"time"
 )
 
+// SocksCred 是一条隧道的 SOCKS5 访问凭据。
+//
+// 每条隧道一套独立凭据：泄露一条不会连累其他出口，
+// 换节点时也能只重置这一条而不影响已分发的其他配置。
+type SocksCred struct {
+	User string `json:"user"`
+	Pass string `json:"pass"`
+}
+
 // Tunnel 是一条运行中的隧道：一个 netns + 一个 openvpn 进程 + 一个本地 SOCKS5 端口。
 type Tunnel struct {
-	Slot     int    `json:"slot"`
-	Port     int    `json:"port"`
-	Node     Node   `json:"node"`
-	Status   string `json:"status"` // starting | up | failed | stopped
-	ExitIP   string `json:"exit_ip"`
-	Err      string `json:"err,omitempty"`
-	Since    time.Time `json:"since"`
+	Slot   int       `json:"slot"`
+	Port   int       `json:"port"`
+	Node   Node      `json:"node"`
+	Status string    `json:"status"` // starting | up | failed | stopped
+	ExitIP string    `json:"exit_ip"`
+	Err    string    `json:"err,omitempty"`
+	Since  time.Time `json:"since"`
+	Cred   SocksCred `json:"cred"`
 
 	ns       string
 	listener net.Listener
 	ovpn     *exec.Cmd
 	mu       sync.Mutex
+	stopCh   chan struct{} // 关闭时通知 bringUp 的自动重试循环退出
 }
 
 func (t *Tunnel) nsName() string { return fmt.Sprintf("fo%d", t.Slot) }
 func (t *Tunnel) subnet() string { return fmt.Sprintf("10.99.%d", t.Slot) }
+
+// stopped 判断这条隧道是不是已经被用户主动停掉了。
+// bringUp 的自动重试循环靠这个决定要不要继续跑下去。
+func (t *Tunnel) stopped() bool {
+	if t.stopCh == nil {
+		return false
+	}
+	select {
+	case <-t.stopCh:
+		return true
+	default:
+		return false
+	}
+}
 
 func run(name string, args ...string) error {
 	out, err := exec.Command(name, args...).CombinedOutput()
@@ -207,10 +232,27 @@ func (t *Tunnel) serve() error {
 			if err != nil {
 				return
 			}
-			go serveSocks(conn, dial)
+			// 每次连接现取凭据：改口令后不必重建监听，新连接立刻按新凭据校验
+			cred := t.credential()
+			go serveSocks(conn, &cred, dial)
 		}
 	}()
 	return nil
+}
+
+// credential 取一份凭据副本，避免读写并发。
+func (t *Tunnel) credential() SocksCred {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.Cred
+}
+
+// setCredential 换掉这条隧道的 SOCKS5 凭据。已建立的连接不受影响，
+// 新连接立即按新凭据校验。
+func (t *Tunnel) setCredential(c SocksCred) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.Cred = c
 }
 
 // probeExitIP 通过隧道查询出口 IP，用于确认这条隧道确实换了 IP。
@@ -231,6 +273,14 @@ func (t *Tunnel) probeExitIP() (string, error) {
 func (t *Tunnel) stop() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	if t.stopCh != nil {
+		select {
+		case <-t.stopCh:
+			// 已经关过，避免重复 close 触发 panic
+		default:
+			close(t.stopCh)
+		}
+	}
 	if t.listener != nil {
 		t.listener.Close()
 		t.listener = nil
