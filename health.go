@@ -9,9 +9,11 @@ import (
 )
 
 const (
-	healthInterval = 10 * time.Second
-	healthFailures = 2 // 连续失败几次才判定掉线，避免网络抖动误杀
-	healthTimeout  = 6 * time.Second
+	healthInterval      = 10 * time.Second
+	healthFailures      = 2 // 连续失败几次才判定掉线，避免网络抖动误杀
+	healthTimeout       = 6 * time.Second
+	bringUpRetryBackoff = 5 * time.Second  // 一整轮候选都失败后，隔多久自动开始下一轮
+	staleNodesInterval  = 60 * time.Second // 节点列表隔多久允许自动刷新一次
 )
 
 // WatchHealth 周期检查每条隧道是否还能出网，掉线的自动换节点重连。
